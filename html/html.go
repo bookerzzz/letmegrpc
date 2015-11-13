@@ -33,6 +33,8 @@ import (
 	"github.com/gogo/protobuf/protoc-gen-gogo/generator"
 )
 
+const backtick = "`"
+
 type html struct {
 	*generator.Generator
 	generator.PluginImports
@@ -98,6 +100,71 @@ func (p *html) generateFormFunc(servName string, method *descriptor.MethodDescri
 	p.P(`var Form`, servName, "_", method.GetName(), " string = `", s, "`")
 }
 
+func (p *html) CamelCaseFieldPath(fieldPath []string) string { // TODO: move to apropriate place (package generator ??)
+	var path string
+	for _, field := range fieldPath {
+		if len(path) > 0 {
+			path += "."
+		}
+		path += generator.CamelCase(field)
+	}
+	return path
+}
+
+func (p *html) generateOneofScanner(field *descriptor.FieldDescriptorProto, fieldPath []string) {
+	if !field.IsMessage() {
+		// skip
+		return
+	}
+
+	// path to the oneof field within the root message (input message)
+	fieldPath = append(fieldPath, field.GetName())
+
+	fieldDesc := p.ObjectNamed(field.GetTypeName()).(*generator.Descriptor)
+
+	var oneofDecls = make(map[int32]*descriptor.OneofDescriptorProto)
+	var oneofFields = make(map[int32][]*descriptor.FieldDescriptorProto)
+
+	for i, oneof := range fieldDesc.OneofDecl {
+		oneofDecls[int32(i)] = oneof
+	}
+
+	for _, subfield := range fieldDesc.GetField() {
+		if subfield.OneofIndex != nil {
+			oneofFields[*subfield.OneofIndex] = append(oneofFields[*subfield.OneofIndex], subfield)
+		}
+	}
+
+	for i, oneofDecl := range oneofDecls {
+		p.P(`case "`, strings.Join(fieldPath, "."), `.`, oneofDecl.GetName(), `":`)
+		p.In()
+		p.P(`switch one.Selected {`)
+		for _, oneofField := range oneofFields[i] { // fields.. ?
+			p.P(`case "`, fieldDesc.GetName(), `_`, generator.CamelCase(oneofField.GetName()), `":`)
+			p.In()
+			p.P(`msg.`, p.CamelCaseFieldPath(fieldPath), ` = &`, fieldDesc.GetName(), `{`)
+			p.In()
+			p.P(generator.CamelCase(oneofDecl.GetName()), `: &`, fieldDesc.GetName(), `_`, generator.CamelCase(oneofField.GetName()), `{},`)
+			p.Out()
+			p.P(`}`)
+			p.Out()
+		}
+		p.P(`if msg.`, p.CamelCaseFieldPath(fieldPath), ` != nil {`)
+		p.In()
+		p.P(`err := encoding_json.Unmarshal(one.Value, msg.`, p.CamelCaseFieldPath(fieldPath), `)`)
+		p.writeError(errString)
+		p.P(`}`)
+		p.Out()
+		p.P(`}`)
+		p.Out()
+	}
+
+	// recursive for child fields
+	for _, subfield := range fieldDesc.GetField() {
+		p.generateOneofScanner(subfield, fieldPath)
+	}
+}
+
 func (p *html) Generate(file *generator.FileDescriptor) {
 	p.PluginImports = generator.NewPluginImports(p.Generator)
 	httpPkg := p.NewImport("net/http")
@@ -149,6 +216,14 @@ func (p *html) Generate(file *generator.FileDescriptor) {
 	p.Out()
 	p.P(`}`)
 
+	p.P(`// oneofFields maps outer field name to selected field and it's value.`)
+	p.P(`type oneofFields map[string]struct {`)
+	p.In()
+	p.P(`Selected string                   `, backtick, `json:"selected"`, backtick)
+	p.P(`Value    encoding_json.RawMessage `, backtick, `json:"value"`, backtick)
+	p.Out()
+	p.P(`}`)
+
 	for _, s := range file.GetService() {
 		origServName := s.GetName()
 		servName := generator.CamelCase(origServName)
@@ -172,6 +247,7 @@ func (p *html) Generate(file *generator.FileDescriptor) {
 			p.In()
 			p.P("w.Write([]byte(Header(`", servName, "`,`", m.GetName(), "`)))")
 			p.P(`jsonString := req.FormValue("json")`)
+			p.P(`oneofsString := req.FormValue("oneofs")`)
 			p.P(`someValue := false`)
 			p.RecordTypeUse(m.GetInputType())
 			p.P(`msg := &`, p.typeName(m.GetInputType()), `{}`)
@@ -180,8 +256,28 @@ func (p *html) Generate(file *generator.FileDescriptor) {
 			p.P(`err := `, p.jsonPkg.Use(), `.Unmarshal([]byte(jsonString), msg)`)
 			p.writeError(errString)
 			p.P(`someValue = true`)
+
+			p.P(`if len(oneofsString) > 0 {`)
+			p.In()
+			p.P(`oneofs := make(oneofFields)`)
+			p.P(`err := encoding_json.Unmarshal([]byte(oneofsString), &oneofs)`)
+			p.writeError(errString)
+			p.P(`for field, one := range oneofs {`)
+			p.In()
+			p.P(`switch field {`)
+			d := p.ObjectNamed(m.GetInputType()).(*generator.Descriptor)
+			for _, f := range d.GetField() { //++ add this to generateOneofScanner ?
+				p.generateOneofScanner(f, nil)
+			}
 			p.Out()
 			p.P(`}`)
+			p.Out()
+			p.P(`}`)
+			p.Out()
+			p.P(`}`)
+			p.Out()
+			p.P(`}`)
+
 			p.P(`w.Write([]byte(Form`, servName, `_`, m.GetName(), `))`)
 			p.P(`if someValue {`)
 			p.In()
